@@ -1,0 +1,141 @@
+name: Build vLLM-Ascend app image (ACR)
+
+# vLLM-Ascend 出包流水线 —— 只做 Python "app 层"，不重编 csrc。
+#
+# 与 vllm-backport 的分层思路一致，但更简单：本仓不改 csrc 时无需自建 base，
+# 直接以官方 nightly 为底座，一层 COPY 即可（秒级构建）。
+#
+# 风险点与对策：底座 nightly 是滚动的，Python 与底座 .so 一旦版本不一致，
+# 症状是运行期数值错误而不是构建失败。因此：
+#   1) guard-1 检查 csrc/cmake/setup.py/requirements 自 base_commit 起未变；
+#   2) guard-2 校验底座镜像内 vllm_ascend 的版本串包含 base_commit 的 commit hash。
+#
+# Secrets（与 gpustack / vllm-backport fork 同名）：
+#   ACR_USERNAME / ACR_PASSWORD
+#
+# Run: Actions -> 本流水线 -> Run workflow
+#   or: gh workflow run build-ascend-app.yml --ref main
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_image:
+        description: '底座镜像（必须与 base_commit 对应）'
+        default: 'quay.io/ascend/vllm-ascend:nightly-main'
+        required: true
+      base_commit:
+        description: '底座镜像内 vllm_ascend 的 commit（guard 用，填了才检查）'
+        default: '4e6eac4e4'
+        required: false
+      dest_tag:
+        description: '浮动 tag'
+        default: 'glm53-kda-latest'
+        required: true
+
+env:
+  ACR_REGISTRY: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com
+  ACR_REPO: crpi-xzr81d0490mc3794.cn-shanghai.personal.cr.aliyuncs.com/reputationly/vllm-ascend
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # guard-1：影响原生编译的路径在 base 之后有改动，就必须重建 base。
+      - name: Guard 1 — native build inputs unchanged since base
+        if: ${{ github.event.inputs.base_commit != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.inputs.base_commit }}"
+          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "::error::base_commit ${BASE} 不在本仓历史里（base 是从别的分支编的？）"
+            exit 1
+          fi
+          CHANGED="$(git diff --name-only "${BASE}" HEAD -- \
+            csrc CMakeLists.txt cmake setup.py requirements.txt pyproject.toml docker/Dockerfile)"
+          if [ -n "${CHANGED}" ]; then
+            echo "::error::以下影响原生编译的路径在 base(${BASE})之后有改动，必须重建底座："
+            echo "${CHANGED}" | sed 's/^/  /'
+            exit 1
+          fi
+          echo "OK: 自 ${BASE} 起 csrc/cmake/依赖未变，app 层足够。"
+
+      # guard-2：校验底座镜像内代码确实是 base_commit，避免 Python/.so 错配。
+      - name: Guard 2 — base image code matches base_commit
+        if: ${{ github.event.inputs.base_commit != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE_COMMIT="${{ github.event.inputs.base_commit }}"
+          SHORT7="$(git rev-parse --short=7 "$BASE_COMMIT")"
+          docker pull "${{ github.event.inputs.base_image }}"
+          VER="$(docker run --rm --entrypoint bash "${{ github.event.inputs.base_image }}" \
+                  -lc 'pip show vllm-ascend 2>/dev/null | awk "/^Version:/{print \$2}"')"
+          echo "base image vllm-ascend version: ${VER}"
+          if [ -z "${VER}" ]; then
+            echo "::error::无法读取底座镜像内的 vllm-ascend 版本"
+            exit 1
+          fi
+          case "${VER}" in
+            *"+g${SHORT7}"*) echo "OK: 底座 commit 与 ${BASE_COMMIT} 一致。" ;;
+            *) echo "::error::底座镜像 commit 与 base_commit(${BASE_COMMIT}) 不一致：${VER}"
+               echo "请改用与源码基线匹配的底座，或把 base_commit 改成底座实际 commit。"
+               exit 1 ;;
+          esac
+
+      - name: Compute tags
+        id: tags
+        shell: bash
+        run: |
+          echo "version=ascend-$(date -u +%Y%m%d-%H%M)-$(git rev-parse --short=8 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Aliyun ACR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push app layer (arm64)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.ascend_app
+          platforms: linux/arm64
+          push: true
+          # 阿里云 ACR 个人版不认 buildx 的证明清单（空描述符），显式关掉。
+          provenance: false
+          sbom: false
+          build-args: |
+            BASE_IMAGE=${{ github.event.inputs.base_image }}
+          tags: |
+            ${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}
+            ${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tags.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: vllm-ascend app image ${{ steps.tags.outputs.version }}
+          body: |
+            vLLM-Ascend Python app layer（arm64 / 910B.x）。
+
+            - Floating: `${{ env.ACR_REPO }}:${{ github.event.inputs.dest_tag }}`
+            - Immutable: `${{ env.ACR_REPO }}:${{ steps.tags.outputs.version }}`
+            - Digest: `${{ steps.build.outputs.digest }}`
+            - Base: `${{ github.event.inputs.base_image }}`
+            - Base commit: `${{ github.event.inputs.base_commit }}`
+            - Commit: ${{ github.sha }}

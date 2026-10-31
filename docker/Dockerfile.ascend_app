@@ -1,0 +1,15 @@
+# vLLM-Ascend 运行镜像 "app 层"：只覆盖 Python 代码，不重编 csrc。
+#
+# 底座必须是与本仓库源码基线一致的官方 nightly（BASE_COMMIT）。这是分层
+# 出包最大的风险点：Python 是新的、底座里的 .so 是旧的，症状会是运行期
+# 数值错误而不是构建失败。流水线里的 guard 步骤会挡住这种漂移。
+ARG BASE_IMAGE=quay.io/ascend/vllm-ascend:nightly-main
+FROM ${BASE_IMAGE}
+
+USER root
+# 运行时 import 路径是镜像内的 /vllm-workspace/vllm-ascend/vllm_ascend/
+COPY vllm_ascend/ /vllm-workspace/vllm-ascend/vllm_ascend/
+
+LABEL org.opencontainers.image.title="vllm-ascend-app" \
+      org.opencontainers.image.description="vLLM-Ascend Python layer over the official nightly base" \
+      org.opencontainers.image.base.name="${BASE_IMAGE}"
